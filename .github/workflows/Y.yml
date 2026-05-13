@@ -1,0 +1,130 @@
+name: Download YouTube Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "YouTube video URL"
+        required: true
+        type: string
+      quality:
+        description: "Quality to download"
+        required: true
+        type: choice
+        options:
+          - best
+          - 1080
+          - 720
+          - 480
+          - 360
+        default: best
+      output_name:
+        description: "Output filename without extension"
+        required: true
+        type: string
+        default: video
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install yt-dlp and ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python3 -m pip install --upgrade pip
+          pip install yt-dlp
+
+      - name: Download video
+        id: download
+        run: |
+          URL="${{ github.event.inputs.url }}"
+          QUALITY="${{ github.event.inputs.quality }}"
+          OUT="${{ github.event.inputs.output_name }}"
+
+          case "$QUALITY" in
+            best)
+              FORMAT="bv*+ba/b"
+              ;;
+            1080)
+              FORMAT="bv*[height<=1080]+ba/b[height<=1080]"
+              ;;
+            720)
+              FORMAT="bv*[height<=720]+ba/b[height<=720]"
+              ;;
+            480)
+              FORMAT="bv*[height<=480]+ba/b[height<=480]"
+              ;;
+            360)
+              FORMAT="bv*[height<=360]+ba/b[height<=360]"
+              ;;
+            *)
+              echo "Invalid quality selection"
+              exit 1
+              ;;
+          esac
+
+          mkdir -p downloads
+          # Download to a temporary file, we'll convert it next
+          yt-dlp \
+            -f "$FORMAT" \
+            --merge-output-format mp4 \
+            -o "downloads/${OUT}_temp.%(ext)s" \
+            "$URL"
+
+          FILE=$(ls downloads/${OUT}_temp.* | head -n 1)
+          echo "downloaded_temp_path=$FILE" >> "$GITHUB_OUTPUT"
+          echo "Downloaded temporary file: $FILE"
+
+      - name: Convert to H.265 (HEVC) MP4
+        id: convert
+        run: |
+          TEMP_FILE="${{ steps.download.outputs.downloaded_temp_path }}"
+          OUT_NAME="${{ github.event.inputs.output_name }}"
+          OUTPUT_FILE="downloads/${OUT_NAME}.mp4"
+
+          ffmpeg -i "$TEMP_FILE" -c:v libx265 -crf 28 -preset medium -c:a copy "$OUTPUT_FILE"
+
+          echo "converted_path=$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
+          echo "Converted video to $OUTPUT_FILE"
+
+      - name: Check file size
+        id: sizecheck
+        run: |
+          FILE="${{ steps.convert.outputs.converted_path }}"
+          SIZE=$(stat -c%s "$FILE")
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "File size: $SIZE bytes"
+
+          # 50MB = 52,428,800 bytes
+          if [ "$SIZE" -gt 52428800 ]; then
+            echo "too_large=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "too_large=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit file to repo
+        if: steps.sizecheck.outputs.too_large == 'false'
+        run: |
+          FILE="${{ steps.convert.outputs.converted_path }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p videos
+          # Ensure the destination filename is correct
+          DEST_FILE="videos/${{ github.event.inputs.output_name }}.mp4"
+          mv "$FILE" "$DEST_FILE"
+          git add "$DEST_FILE"
+          git commit -m "Add H.265 encoded YouTube video: ${{ github.event.inputs.output_name }}" || echo "No changes to commit"
+          git push
+
+      - name: Report too large
+        if: steps.sizecheck.outputs.too_large == 'true'
+        run: |
+          echo "Video exceeds 50MB after conversion, not uploading to repo."
